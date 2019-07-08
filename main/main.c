@@ -1,12 +1,8 @@
-/* Hello World Example
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
+
 #include <stdio.h>
 #include <stddef.h>
 #include <string.h>
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/FreeRTOSConfig.h"
 #include "freertos/task.h"
@@ -27,7 +23,7 @@
 #include "esp_attr.h"
 #include "driver/uart.h"
 #include "esp_intr_alloc.h"
-#include "rom/ets_sys.h"
+#include "esp32/rom/ets_sys.h"
 
 #define PI 3.14159
 
@@ -210,23 +206,23 @@ static void ParseSerialDataTask(void *pvParameters)
 			switch(packet.type){
 				case DAC_A:
 					printf("Updating DAC A\n");
-					PopulateTransData(transA, sineBufferCharA, &packet);
-					PrintfSineBuffer(sineBufferCharA);
+					PopulateTransData(transA, &sineBufferCharA[0][0], &packet);
+					PrintfSineBuffer(&sineBufferCharA[0][0]);
 					break;
 				case DAC_B:
 					printf("Updating DAC B\n");
-					PopulateTransData(transB, sineBufferCharB, &packet);
-					PrintfSineBuffer(sineBufferCharB);
+					PopulateTransData(transB, &sineBufferCharB[0][0], &packet);
+					PrintfSineBuffer(&sineBufferCharB[0][0]);
 					break;
 				case DAC_C:
 					printf("Updating DAC C\n");
-					PopulateTransData(transC, sineBufferCharC, &packet);
-					PrintfSineBuffer(sineBufferCharC);
+					PopulateTransData(transC, &sineBufferCharC[0][0], &packet);
+					PrintfSineBuffer(&sineBufferCharC[0][0]);
 					break;
 				case DAC_D:
 					printf("Updating DAC D\n");
-					PopulateTransData(transD, sineBufferCharD, &packet);
-					PrintfSineBuffer(sineBufferCharD);
+					PopulateTransData(transD, &sineBufferCharD[0][0], &packet);
+					PrintfSineBuffer(&sineBufferCharD[0][0]);
 					break;
 				case DAC_UPDATE_PERIOD:
 					printf("Updating Timer Interrupt Period\n");
@@ -522,11 +518,12 @@ void app_main()
 	DacInit();
 	SerialInit();
 
-	printf("--------------\n");
-    printf("VERSION: 4a\n");
-    printf("--------------\n");
+	printf("----------------------\n");
+	printf("NanoTeslaCCS - ESP32");
+    printf("Version: 5e\n");
+    printf("----------------------\n");
     printf("FreeRTOS tick rate: %dHz\n", configTICK_RATE_HZ );
-    printf("Interrupt period: %dus\n", TIMER_PERIOD_US);
+    printf("Interrupt period (default): %dus\n", TIMER_PERIOD_US);
 
     /* Print chip information */
     esp_chip_info_t chip_info;
