@@ -2,28 +2,37 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <string.h>
+
 #include "sdkconfig.h"
+
+#include "serial.h"
+#include "math.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/FreeRTOSConfig.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
+#include "freertos/timers.h"
+
+#include "driver/spi_common.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/periph_ctrl.h"
+#include "driver/timer.h"
+
+#include "soc/gpio_struct.h"
+#include "soc/timer_group_struct.h"
+
 #include "esp_system.h"
 #include "esp_spi_flash.h"
 #include "esp_types.h"
-#include "driver/spi_common.h"
-#include "driver/spi_master.h"
-#include "soc/gpio_struct.h"
-#include "driver/gpio.h"
-#include "freertos/timers.h"
-#include "math.h"
-#include "soc/timer_group_struct.h"
-#include "driver/periph_ctrl.h"
-#include "driver/timer.h"
 #include "esp_intr_alloc.h"
 #include "esp_attr.h"
-#include "driver/uart.h"
 #include "esp_intr_alloc.h"
 #include "esp32/rom/ets_sys.h"
+
+#include "globals.h"
 
 #define PI 3.14159
 
@@ -37,6 +46,7 @@
 
 #define GPIO_TIMER_EN	GPIO_NUM_27
 #define GPIO_DEBUG_LED	GPIO_NUM_12
+#define GPIO_TRANS_EN	GPIO_NUM_32
 
 #define DAC_A				0x11				// Array indexes for each of the DAC channels
 #define DAC_B				0x12				// These also set the command and address byte in the DACs
@@ -50,31 +60,34 @@
 #define DAC_4	3
 
 
-#define BUFFER_SIZE 24							// Number of data points in sine wave array
-#define SERIAL_BUFFER_SIZE (BUFFER_SIZE * 2) 	// 2 bytes per data point.
-#define DAC_ICS 3								// Initial testings with 3 DAC ICs for 12 speakers on outer ring.
+#define BUFFER_SIZE_MAX 		24					// Number of data points in sine wave array
+#define SERIAL_BUFFER_SIZE_MAX 	(BUFFER_SIZE_MAX * 2) 	// 2 bytes per data point.
+#define DAC_ICS 				2					// Initial testings with 3 DAC ICs for 12 speakers on outer ring.
 
 #define TIMER_DIVIDER 80						// 1us per timer tick
 #define TIMER_PERIOD_US 100	 					// With 1us per timer tick
 
 // GLOBAL VARIABLES
 spi_device_handle_t spi;
-uint8_t sineBufferCharA[BUFFER_SIZE][3 * DAC_ICS];
-uint8_t sineBufferCharB[BUFFER_SIZE][3 * DAC_ICS];
-uint8_t sineBufferCharC[BUFFER_SIZE][3 * DAC_ICS];
-uint8_t sineBufferCharD[BUFFER_SIZE][3 * DAC_ICS];
-static spi_transaction_t transA[BUFFER_SIZE];
-static spi_transaction_t transB[BUFFER_SIZE];
-static spi_transaction_t transC[BUFFER_SIZE];
-static spi_transaction_t transD[BUFFER_SIZE];
+
+// These 4 buffers are pointed to by the transaction structs for the tx_data. Currently they are fixed at a large size.
+uint8_t sineBufferCharA[BUFFER_SIZE_MAX * 3 * DAC_ICS];
+uint8_t sineBufferCharB[BUFFER_SIZE_MAX * 3 * DAC_ICS];
+uint8_t sineBufferCharC[BUFFER_SIZE_MAX * 3 * DAC_ICS];
+uint8_t sineBufferCharD[BUFFER_SIZE_MAX * 3 * DAC_ICS];
+static spi_transaction_t transA[BUFFER_SIZE_MAX];
+static spi_transaction_t transB[BUFFER_SIZE_MAX];
+static spi_transaction_t transC[BUFFER_SIZE_MAX];
+static spi_transaction_t transD[BUFFER_SIZE_MAX];
 esp_err_t ret;
+
+int dacDataPoints;
 
 
 typedef struct{
 	uint8_t size;
 	uint8_t type;
-	uint8_t data[SERIAL_BUFFER_SIZE * DAC_ICS];
-	uint8_t delimiter;
+	uint8_t data[SERIAL_BUFFER_SIZE_MAX * DAC_ICS];
 } serialRx_t;
 
 int bufferIndex;
@@ -86,15 +99,14 @@ TaskHandle_t xHandlingTask = NULL;
 TaskHandle_t xSerialTask = NULL;
 
 
-/* Function Prototypes */
+// Function Prototypes
 void TimerInit(void);
 void SpiInit(void);
 void DacInit(void);
-void SerialInit(void);
 void GpioInit(void);
 void UpdateTimerPeriod(serialRx_t *ptr_rxBuffer);
 void PopulateTransData(spi_transaction_t *ptr_trans, uint8_t *ptr_buffer, serialRx_t *ptr_rxBuffer);
-void PrintfSineBuffer(uint8_t *ptr_buffer);
+void PrintfChannelBuffer(uint8_t *ptr_buffer);
 static void SerialTask(void *pvParameters);
 static void ParseSerialDataTask(void *pvParameters);
 static void SpiTask(void *pvParameters);
@@ -117,45 +129,19 @@ void IRAM_ATTR PingSPI_isr()
     gpio_set_level(PIN_NUM_LDAC, 0);
     gpio_set_level(PIN_NUM_LDAC, 1);
 
-	//gpio_set_level(GPIO_NUM_17, 1);
-	//gpio_set_level(GPIO_NUM_17, 0);
-
 	spiSendNow = 1;
 
     xTaskNotifyFromISR( xHandlingTask, ulStatusRegister, eSetBits, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR();
 }
 
-/***************************************************************************************
- *  Function: SerialInit
- *
- *  Setup serial port for user interface.
- *
- *  Returns:
- *  - Void
- *  Parameters:
- *  - Void
- *****************************************************************************************/
-void SerialInit()
-{
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
 
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, GPIO_NUM_2, GPIO_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_2, 1024, 0, 0, NULL, 0));
-}
 /***************************************************************************************
  *  Function: SerialTask
  *
- *  Polls UART2 for data and then sends it back.
  *
- *  Returns:two is -
+ *
+ *  Returns:
  *  - Void
  *  Parameters:
  *  - *pvParameters
@@ -165,11 +151,11 @@ static void SerialTask(void *pvParameters)
 	int len;
 	BaseType_t xStatus;
     // Configure a temporary buffer for the incoming data
-    uint8_t *serialData = (uint8_t *) malloc((SERIAL_BUFFER_SIZE * DAC_ICS) + 3);
+    uint8_t *serialData = (uint8_t *) malloc((SERIAL_BUFFER_SIZE_MAX * DAC_ICS) + 3);
 
 	while(1)
 	{
-		len = uart_read_bytes(UART_NUM_2, serialData, ((SERIAL_BUFFER_SIZE * DAC_ICS) + 3), 100 / portTICK_PERIOD_MS);
+		len = uart_read_bytes(UART_NUM_2, serialData, ((SERIAL_BUFFER_SIZE_MAX * DAC_ICS) + 3), 100 / portTICK_PERIOD_MS);
 		if(len > 0){
 			xStatus = xQueueSendToBack(xQueue, serialData, 0);
 			if( xStatus != pdPASS ){
@@ -201,28 +187,28 @@ static void ParseSerialDataTask(void *pvParameters)
 			printf("Parsing new data...\n");
 			printf("Size:\t%d\n", packet.size);
 			printf("Type:\t%x\n", packet.type);
-			printf("Delim:\t'%c'\n\n", packet.delimiter);
+			printf("Delim:\t'%c'\n\n", packet.data[packet.size - 3]);
 
 			switch(packet.type){
 				case DAC_A:
-					printf("Updating DAC A\n");
-					PopulateTransData(transA, &sineBufferCharA[0][0], &packet);
-					PrintfSineBuffer(&sineBufferCharA[0][0]);
+					printf("Updating channel A\n");
+					PopulateTransData(transA, &sineBufferCharA[0], &packet);
+					PrintfChannelBuffer(&sineBufferCharA[0]);
 					break;
 				case DAC_B:
-					printf("Updating DAC B\n");
-					PopulateTransData(transB, &sineBufferCharB[0][0], &packet);
-					PrintfSineBuffer(&sineBufferCharB[0][0]);
+					printf("Updating channel B\n");
+					PopulateTransData(transB, &sineBufferCharB[0], &packet);
+					PrintfChannelBuffer(&sineBufferCharB[0]);
 					break;
 				case DAC_C:
-					printf("Updating DAC C\n");
-					PopulateTransData(transC, &sineBufferCharC[0][0], &packet);
-					PrintfSineBuffer(&sineBufferCharC[0][0]);
+					printf("Updating channel C\n");
+					PopulateTransData(transC, &sineBufferCharC[0], &packet);
+					PrintfChannelBuffer(&sineBufferCharC[0]);
 					break;
 				case DAC_D:
-					printf("Updating DAC D\n");
-					PopulateTransData(transD, &sineBufferCharD[0][0], &packet);
-					PrintfSineBuffer(&sineBufferCharD[0][0]);
+					printf("Updating channel D\n");
+					PopulateTransData(transD, &sineBufferCharD[0], &packet);
+					PrintfChannelBuffer(&sineBufferCharD[0]);
 					break;
 				case DAC_UPDATE_PERIOD:
 					printf("Updating Timer Interrupt Period\n");
@@ -263,41 +249,46 @@ void UpdateTimerPeriod(serialRx_t *ptr_rxBuffer)
 /***************************************************************************************
  *  Function: PopulateTransData
  *
- *
+ *	For each SPI transmission we need a buffer with the data for 1 channel of each DAC.
+ *	The data is formatted to 3 bytes per DAC (Cmd/Addr, MSB, LSB). ptr_trans allows many
+ *	transaction structs to facilitate the setup of AC waveforms.
+ *	Data is sent little-endian, so DAC 1 should occupy the highest bytes (thus tx'ed last).
  *
  *  Returns:
  *  - Void
  *  Parameters:
- *  - *pvParameters
+ *  - *ptr_trans 		Ptr to transaction struct array.
+ *  - *ptr_buffer		Ptr to data buffer for each transaction.
+ *  - *ptr_rxBuffer		Ptr to serial rx data struct ready for formatting.
  *****************************************************************************************/
 void PopulateTransData(spi_transaction_t *ptr_trans, uint8_t *ptr_buffer, serialRx_t *ptr_rxBuffer)
 {
-	int i;
+	int i, j;
+	int offset;
 
-	// Populate a temporary data array that will be sent over SPI to DACs
-	for(i = 0; i < BUFFER_SIZE; i++){
+	// Determine the number of data points by taking the number of bytes in the data field
+	// and dividing by the number of DACs in circuit.
+	dacDataPoints = ((ptr_rxBuffer->size) - 3) / (2 * DAC_ICS);
+	printf("data points: %d\n", dacDataPoints);
+
+	for(i = 0; i < dacDataPoints; i++){
+		// For each data point setup a transaction structure
 		ptr_trans->flags = 0;
-		ptr_trans->length = 8 * 3 * DAC_ICS;		// bit per byte * bytes per DAC * Num. DACs
+		ptr_trans->length = 8 * 3 * DAC_ICS;		// bit per byte * bytes per DAC * Number of DACs
 		ptr_trans->tx_buffer = ptr_buffer;			// Point to start of 'sineBufferCharX' before it is
 		ptr_trans->addr = 0;						// incremented below.
 		ptr_trans->cmd = 0;
 		ptr_trans->rxlength = 0;
 
-		ptr_trans++;								// Now point to the next transmit struct.
+		ptr_trans++;								// Point to the next transmit structure.
 
-		*ptr_buffer++ = ptr_rxBuffer->type;
-		*ptr_buffer++ = ptr_rxBuffer->data[(2 * SERIAL_BUFFER_SIZE) + (i * 2)];
-		*ptr_buffer++ = ptr_rxBuffer->data[(2 * SERIAL_BUFFER_SIZE) + (i * 2) + 1];
-
-		*ptr_buffer++ = ptr_rxBuffer->type;
-		*ptr_buffer++ = ptr_rxBuffer->data[SERIAL_BUFFER_SIZE + (i * 2)];
-		*ptr_buffer++ = ptr_rxBuffer->data[SERIAL_BUFFER_SIZE + (i * 2) + 1];
-
-		*ptr_buffer++ = ptr_rxBuffer->type;
-		*ptr_buffer++ = ptr_rxBuffer->data[(i * 2)];
-		*ptr_buffer++ = ptr_rxBuffer->data[(i * 2) + 1];
-		// ptr_buffer will now point to the start of the next column in the 'sineBufferCharX' array.
-		// Ready for next time around the for loop.
+		offset = i * 2;
+	    for(j = 0; j < DAC_ICS; j++){
+			*ptr_buffer++ = ptr_rxBuffer->type;				// Command byte
+			*ptr_buffer++ = ptr_rxBuffer->data[offset];	    // MSB
+			*ptr_buffer++ = ptr_rxBuffer->data[offset + 1];	// LSB
+			offset += dacDataPoints * 2;
+	    }
 	}
 }
 /***************************************************************************************
@@ -327,14 +318,14 @@ void SpiTask(void *pvParameters)
 
 			spiSendNow = 0;
 			bufferIndex++;
-			if(bufferIndex >= BUFFER_SIZE)	bufferIndex = 0;
+			if(bufferIndex >= dacDataPoints)	bufferIndex = 0;
 			gpio_set_level(GPIO_NUM_15, 0);
 		}
     }
 }
 
 /***************************************************************************************
- *  Function: PrintfSineBuffer
+ *  Function: PrintfChannelBuffer
  *
  *
  *
@@ -343,15 +334,23 @@ void SpiTask(void *pvParameters)
  *  Parameters:
  *  - *ptr_buffer
  *****************************************************************************************/
-void PrintfSineBuffer(uint8_t *ptr_buffer)
+void PrintfChannelBuffer(uint8_t *ptr_buffer)
 {
 	int i, j;
 
-	for(i = 0; i < (BUFFER_SIZE); i++){
+	printf("T");
+	for(i = 1; i <= DAC_ICS; i ++){
+		printf("\tDAC %d\t", i);
+	}
+	printf("\n");
+
+	for(i = 0; i < dacDataPoints; i++){
 		printf("[%02d]\t", i);
-		for(j = 0; j < 9; j++)
-		{
-			printf("%02x\t", *ptr_buffer++);
+
+		for(j = 0; j < DAC_ICS; j++){
+			printf("0x%02X ", *ptr_buffer++);
+			printf("0x%02X",  *ptr_buffer++);
+			printf("%02X\t",  *ptr_buffer++);
 		}
 		printf("\n");
 	}
@@ -494,7 +493,6 @@ void DacInit()
  *****************************************************************************************/
 void GpioInit(void)
 {
-
 	// Setup Debug red LED GPIO pin
 	PIN_FUNC_SELECT(IO_MUX_GPIO12_REG, PIN_FUNC_GPIO);
 	gpio_set_direction(GPIO_DEBUG_LED, GPIO_MODE_OUTPUT);
@@ -503,6 +501,11 @@ void GpioInit(void)
 	PIN_FUNC_SELECT( IO_MUX_GPIO27_REG, PIN_FUNC_GPIO);
 	gpio_set_direction(GPIO_TIMER_EN, GPIO_MODE_INPUT);
 	gpio_set_pull_mode(GPIO_TIMER_EN, GPIO_PULLUP_ONLY);
+
+	// Output Level Translator Setup and Enable
+	PIN_FUNC_SELECT( IO_MUX_GPIO32_REG, PIN_FUNC_GPIO);
+	gpio_set_direction(GPIO_TRANS_EN, GPIO_MODE_OUTPUT);
+	gpio_set_level(GPIO_TRANS_EN, 1);
 }
 /******************
  *  Function: Main
@@ -519,8 +522,8 @@ void app_main()
 	SerialInit();
 
 	printf("----------------------\n");
-	printf("NanoTeslaCCS - ESP32");
-    printf("Version: 5e\n");
+	printf("NanoTeslaCCS - ESP32\n");
+    printf("Version: 7e\n");
     printf("----------------------\n");
     printf("FreeRTOS tick rate: %dHz\n", configTICK_RATE_HZ );
     printf("Interrupt period (default): %dus\n", TIMER_PERIOD_US);
@@ -543,7 +546,7 @@ void app_main()
     gpio_set_level(PIN_NUM_LDAC, 1);
 
     // Create Queue
-    xQueue = xQueueCreate(5, (((SERIAL_BUFFER_SIZE * DAC_ICS) + 3) * sizeof(int)));
+    xQueue = xQueueCreate(5, (((SERIAL_BUFFER_SIZE_MAX * DAC_ICS) + 3) * sizeof(int)));
     if(xQueue != NULL){
     	// Create Tasks
     	printf("Init Free heap size: %d\n", xPortGetFreeHeapSize());
