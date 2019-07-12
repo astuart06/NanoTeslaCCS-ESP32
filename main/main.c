@@ -32,6 +32,9 @@
 #include "esp_intr_alloc.h"
 #include "esp32/rom/ets_sys.h"
 
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include "esp_log.h"
+
 #include "globals.h"
 
 #define PI 3.14159
@@ -52,17 +55,17 @@
 #define DAC_B				0x12				// These also set the command and address byte in the DACs
 #define DAC_C				0x14
 #define DAC_D				0x18
-#define DAC_UPDATE_PERIOD	0x21				//
+#define DAC_UPDATE_PERIOD	0x21				// Time period between the DAC data transmission.
+#define DAC_NUM_ICS			0x22				// Number of DACs in daisy-chain.
 
 #define DAC_1	0								// Array indexes for each of the individual DAC ICs
 #define DAC_2	1
 #define DAC_3	2
 #define DAC_4	3
 
-
 #define BUFFER_SIZE_MAX 		24					// Number of data points in sine wave array
 #define SERIAL_BUFFER_SIZE_MAX 	(BUFFER_SIZE_MAX * 2) 	// 2 bytes per data point.
-#define DAC_ICS 				2					// Initial testings with 3 DAC ICs for 12 speakers on outer ring.
+#define DAC_ICS_MAX 			6					// Initial testings with 3 DAC ICs for 12 speakers on outer ring.
 
 #define TIMER_DIVIDER 80						// 1us per timer tick
 #define TIMER_PERIOD_US 100	 					// With 1us per timer tick
@@ -71,10 +74,10 @@
 spi_device_handle_t spi;
 
 // These 4 buffers are pointed to by the transaction structs for the tx_data. Currently they are fixed at a large size.
-uint8_t sineBufferCharA[BUFFER_SIZE_MAX * 3 * DAC_ICS];
-uint8_t sineBufferCharB[BUFFER_SIZE_MAX * 3 * DAC_ICS];
-uint8_t sineBufferCharC[BUFFER_SIZE_MAX * 3 * DAC_ICS];
-uint8_t sineBufferCharD[BUFFER_SIZE_MAX * 3 * DAC_ICS];
+uint8_t sineBufferCharA[BUFFER_SIZE_MAX * 3 * DAC_ICS_MAX];
+uint8_t sineBufferCharB[BUFFER_SIZE_MAX * 3 * DAC_ICS_MAX];
+uint8_t sineBufferCharC[BUFFER_SIZE_MAX * 3 * DAC_ICS_MAX];
+uint8_t sineBufferCharD[BUFFER_SIZE_MAX * 3 * DAC_ICS_MAX];
 static spi_transaction_t transA[BUFFER_SIZE_MAX];
 static spi_transaction_t transB[BUFFER_SIZE_MAX];
 static spi_transaction_t transC[BUFFER_SIZE_MAX];
@@ -82,12 +85,15 @@ static spi_transaction_t transD[BUFFER_SIZE_MAX];
 esp_err_t ret;
 
 int dacDataPoints;
+int dacNumICs;
 
+// Terminal logging tag
+static const char* TAG = "main";
 
 typedef struct{
 	uint8_t size;
 	uint8_t type;
-	uint8_t data[SERIAL_BUFFER_SIZE_MAX * DAC_ICS];
+	uint8_t data[SERIAL_BUFFER_SIZE_MAX * DAC_ICS_MAX];
 } serialRx_t;
 
 int bufferIndex;
@@ -98,13 +104,13 @@ QueueHandle_t xQueue;
 TaskHandle_t xHandlingTask = NULL;
 TaskHandle_t xSerialTask = NULL;
 
-
 // Function Prototypes
 void TimerInit(void);
 void SpiInit(void);
 void DacInit(void);
 void GpioInit(void);
 void UpdateTimerPeriod(serialRx_t *ptr_rxBuffer);
+void UpdateDacNumICs(serialRx_t *ptr_rxBuffer);
 void PopulateTransData(spi_transaction_t *ptr_trans, uint8_t *ptr_buffer, serialRx_t *ptr_rxBuffer);
 void PrintfChannelBuffer(uint8_t *ptr_buffer);
 static void SerialTask(void *pvParameters);
@@ -112,9 +118,16 @@ static void ParseSerialDataTask(void *pvParameters);
 static void SpiTask(void *pvParameters);
 static void TimerEnableTask(void *pvParameters);
 
-/*************************
+/***************************************************************************************
  *  Function: PingSPI_isr
- *************************/
+ *
+ *
+ *
+ *  Returns:
+ *  - Void
+ *  Parameters:
+ *  - *pvParameters
+ *****************************************************************************************/
 void IRAM_ATTR PingSPI_isr()
 {
 	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -142,7 +155,6 @@ void IRAM_ATTR PingSPI_isr()
  *
  *
  *  Returns:
- *  - Void
  *  Parameters:
  *  - *pvParameters
  *****************************************************************************************/
@@ -151,11 +163,11 @@ static void SerialTask(void *pvParameters)
 	int len;
 	BaseType_t xStatus;
     // Configure a temporary buffer for the incoming data
-    uint8_t *serialData = (uint8_t *) malloc((SERIAL_BUFFER_SIZE_MAX * DAC_ICS) + 3);
+    uint8_t *serialData = (uint8_t *) malloc((SERIAL_BUFFER_SIZE_MAX * DAC_ICS_MAX) + 3);
 
 	while(1)
 	{
-		len = uart_read_bytes(UART_NUM_2, serialData, ((SERIAL_BUFFER_SIZE_MAX * DAC_ICS) + 3), 100 / portTICK_PERIOD_MS);
+		len = uart_read_bytes(UART_NUM_2, serialData, ((SERIAL_BUFFER_SIZE_MAX * DAC_ICS_MAX) + 3), 100 / portTICK_PERIOD_MS);
 		if(len > 0){
 			xStatus = xQueueSendToBack(xQueue, serialData, 0);
 			if( xStatus != pdPASS ){
@@ -184,10 +196,10 @@ static void ParseSerialDataTask(void *pvParameters)
 	while(1){
 		xStatus = xQueueReceive(xQueue, &packet, 0);
 		if( xStatus == pdPASS ){
-			printf("Parsing new data...\n");
-			printf("Size:\t%d\n", packet.size);
-			printf("Type:\t%x\n", packet.type);
-			printf("Delim:\t'%c'\n\n", packet.data[packet.size - 3]);
+			ESP_LOGI(TAG, "Parsing new data...");
+			ESP_LOGI(TAG, "Size:\t%d", packet.size);
+			ESP_LOGI(TAG, "Type:\t%x", packet.type);
+			ESP_LOGI(TAG, "Delim:\t'%c'", packet.data[packet.size - 3]);
 
 			switch(packet.type){
 				case DAC_A:
@@ -213,6 +225,12 @@ static void ParseSerialDataTask(void *pvParameters)
 				case DAC_UPDATE_PERIOD:
 					printf("Updating Timer Interrupt Period\n");
 					UpdateTimerPeriod(&packet);
+					break;
+				case DAC_NUM_ICS:
+					printf("Updating Number of DAC ICs in serial daisy-chain\n");
+					UpdateDacNumICs(&packet);
+					DacInit();
+					break;
 			}
 			dataReady = 1;
 	    }
@@ -246,6 +264,27 @@ void UpdateTimerPeriod(serialRx_t *ptr_rxBuffer)
 
 	timer_start(TIMER_GROUP_0, TIMER_0);
 }
+
+/***************************************************************************************
+ *  Function: UpdateDacNumICs
+ *
+ *
+ *
+ *  Returns:
+ *  - Void
+ *  Parameters:
+ *  -
+ *****************************************************************************************/
+void UpdateDacNumICs(serialRx_t *ptr_rxBuffer)
+{
+	// Stop the interrupts while we modify the number of DACs
+	timer_pause(TIMER_GROUP_0, TIMER_0);
+
+	dacNumICs = ptr_rxBuffer->data[0];
+	ESP_LOGI(TAG, "Number of DAC ICs: %d", dacNumICs);
+
+	timer_start(TIMER_GROUP_0, TIMER_0);
+}
 /***************************************************************************************
  *  Function: PopulateTransData
  *
@@ -268,13 +307,16 @@ void PopulateTransData(spi_transaction_t *ptr_trans, uint8_t *ptr_buffer, serial
 
 	// Determine the number of data points by taking the number of bytes in the data field
 	// and dividing by the number of DACs in circuit.
-	dacDataPoints = ((ptr_rxBuffer->size) - 3) / (2 * DAC_ICS);
-	printf("data points: %d\n", dacDataPoints);
+	dacDataPoints = ((ptr_rxBuffer->size) - 3) / (2 * dacNumICs);
+	ESP_LOGI(TAG, "PopulateTransData Function");
+	ESP_LOGI(TAG, "Buffer size: %d", ptr_rxBuffer->size);
+	ESP_LOGI(TAG, "dacDataPoints: %d", dacDataPoints);
+	ESP_LOGI(TAG, "dacNumICs: %d", dacNumICs);
 
 	for(i = 0; i < dacDataPoints; i++){
 		// For each data point setup a transaction structure
 		ptr_trans->flags = 0;
-		ptr_trans->length = 8 * 3 * DAC_ICS;		// bit per byte * bytes per DAC * Number of DACs
+		ptr_trans->length = 8 * 3 * dacNumICs;		// bit per byte * bytes per DAC * Number of DACs
 		ptr_trans->tx_buffer = ptr_buffer;			// Point to start of 'sineBufferCharX' before it is
 		ptr_trans->addr = 0;						// incremented below.
 		ptr_trans->cmd = 0;
@@ -283,7 +325,7 @@ void PopulateTransData(spi_transaction_t *ptr_trans, uint8_t *ptr_buffer, serial
 		ptr_trans++;								// Point to the next transmit structure.
 
 		offset = i * 2;
-	    for(j = 0; j < DAC_ICS; j++){
+	    for(j = 0; j < dacNumICs; j++){
 			*ptr_buffer++ = ptr_rxBuffer->type;				// Command byte
 			*ptr_buffer++ = ptr_rxBuffer->data[offset];	    // MSB
 			*ptr_buffer++ = ptr_rxBuffer->data[offset + 1];	// LSB
@@ -339,7 +381,7 @@ void PrintfChannelBuffer(uint8_t *ptr_buffer)
 	int i, j;
 
 	printf("T");
-	for(i = 1; i <= DAC_ICS; i ++){
+	for(i = 1; i <= dacNumICs; i ++){
 		printf("\tDAC %d\t", i);
 	}
 	printf("\n");
@@ -347,7 +389,7 @@ void PrintfChannelBuffer(uint8_t *ptr_buffer)
 	for(i = 0; i < dacDataPoints; i++){
 		printf("[%02d]\t", i);
 
-		for(j = 0; j < DAC_ICS; j++){
+		for(j = 0; j < dacNumICs; j++){
 			printf("0x%02X ", *ptr_buffer++);
 			printf("0x%02X",  *ptr_buffer++);
 			printf("%02X\t",  *ptr_buffer++);
@@ -457,28 +499,25 @@ void SpiInit()
  *****************************************************************************************/
 void DacInit()
 {
-	int i;
+	int i, j;
 	static spi_transaction_t transSetup;
 	uint8_t setupBuffer[9];
 
 	// Repeat 3 bytes for each DAC we need to enable daisy-chain mode
-	for(i = 0; i < 9; i += 3)
+	for(i = 0; i < dacNumICs; i++)
 	{
-		setupBuffer[i] = 0x80;					// Set the DCEN bit to enter register
-		setupBuffer[i + 1] = 0x00;
-		setupBuffer[i + 2] = 0x01;				// Set DB0 to 1 to enable daisy-chain mode
-	}
+		j = 3*i;
+		setupBuffer[j] = 0x80;					// Set the DCEN bit to enter register (MSB)
+		setupBuffer[j + 1] = 0x00;				// (LSB)
+		setupBuffer[j + 2] = 0x01;				// Set DB0 to 1 to enable daisy-chain mode
 
-	transSetup.tx_buffer = &setupBuffer;
-	transSetup.flags = 0;
-	transSetup.length = 24 * 3;
-	transSetup.cmd = 0;
-	transSetup.addr = 0;
+		transSetup.length = 24 * (i + 1);				// length in bits to transmit
+		transSetup.tx_buffer = &setupBuffer;
+		transSetup.flags = 0;
+		transSetup.cmd = 0;
+		transSetup.addr = 0;
 
-	for(i = 0; i < 3; i++)
-	{
-		ret = spi_device_polling_transmit(spi, &transSetup);
-		assert(ret==ESP_OK);
+		spi_device_polling_transmit(spi, &transSetup);
 	}
 }
 /***************************************************************************************
@@ -498,12 +537,12 @@ void GpioInit(void)
 	gpio_set_direction(GPIO_DEBUG_LED, GPIO_MODE_OUTPUT);
 
 	// Timer enable switch input
-	PIN_FUNC_SELECT( IO_MUX_GPIO27_REG, PIN_FUNC_GPIO);
+	PIN_FUNC_SELECT(IO_MUX_GPIO27_REG, PIN_FUNC_GPIO);
 	gpio_set_direction(GPIO_TIMER_EN, GPIO_MODE_INPUT);
 	gpio_set_pull_mode(GPIO_TIMER_EN, GPIO_PULLUP_ONLY);
 
 	// Output Level Translator Setup and Enable
-	PIN_FUNC_SELECT( IO_MUX_GPIO32_REG, PIN_FUNC_GPIO);
+	PIN_FUNC_SELECT(IO_MUX_GPIO32_REG, PIN_FUNC_GPIO);
 	gpio_set_direction(GPIO_TRANS_EN, GPIO_MODE_OUTPUT);
 	gpio_set_level(GPIO_TRANS_EN, 1);
 }
@@ -512,13 +551,14 @@ void GpioInit(void)
  ******************/
 void app_main()
 {
+	esp_log_level_set(TAG, ESP_LOG_DEBUG);
+
 	bufferIndex = 0;
 	spiSendNow = 0;
 	dataReady = 0;
 
 	GpioInit();
 	SpiInit();
-	DacInit();
 	SerialInit();
 
 	printf("----------------------\n");
@@ -546,7 +586,7 @@ void app_main()
     gpio_set_level(PIN_NUM_LDAC, 1);
 
     // Create Queue
-    xQueue = xQueueCreate(5, (((SERIAL_BUFFER_SIZE_MAX * DAC_ICS) + 3) * sizeof(int)));
+    xQueue = xQueueCreate(5, (((SERIAL_BUFFER_SIZE_MAX * DAC_ICS_MAX) + 3) * sizeof(int)));
     if(xQueue != NULL){
     	// Create Tasks
     	printf("Init Free heap size: %d\n", xPortGetFreeHeapSize());
@@ -571,5 +611,3 @@ void app_main()
     	vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
-
-
