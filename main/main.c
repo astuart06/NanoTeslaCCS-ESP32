@@ -544,7 +544,7 @@ void DacInit()
 		//spi_device_polling_end(spi, 100);
 		spi_device_polling_transmit(spi, &transSetup);
 	}
-	printf("Number of DACs in daisy-chain: %d", dacNumICs);
+	printf("Number of DACs in daisy-chain: %d\n", dacNumICs);
 }
 /***************************************************************************************
  *  Function: GpioInit
