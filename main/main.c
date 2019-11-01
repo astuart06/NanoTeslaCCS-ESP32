@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 #include "freertos/timers.h"
+#include "freertos/queue.h"
 
 #include "driver/spi_common.h"
 #include "driver/spi_master.h"
@@ -23,23 +24,30 @@
 
 #include "soc/gpio_struct.h"
 #include "soc/timer_group_struct.h"
+#include "soc/io_mux_reg.h"
 
 #include "esp_system.h"
 #include "esp_spi_flash.h"
 #include "esp_types.h"
-#include "esp_intr_alloc.h"
 #include "esp_attr.h"
 #include "esp_intr_alloc.h"
 #include "esp32/rom/ets_sys.h"
 
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#define LOG_LOCAL_LEVEL ESP_LOG_WARN
 #include "esp_log.h"
 
 #include "globals.h"
 
 #define PI 3.14159
-
+/*
+// PHASED SPEAKER ARRAY PINOUT
 #define PIN_NUM_MISO 19
+#define PIN_NUM_MOSI 18
+#define PIN_NUM_CLK  23
+#define PIN_NUM_CS   5
+*/
+// NANO TESLA PINOUT
+#define PIN_NUM_MISO 33
 #define PIN_NUM_MOSI 18
 #define PIN_NUM_CLK  17
 #define PIN_NUM_CS   5
@@ -49,7 +57,9 @@
 
 #define GPIO_TIMER_EN	GPIO_NUM_27
 #define GPIO_DEBUG_LED	GPIO_NUM_12
+#define GPIO_DEBUG_PIN	GPIO_NUM_26
 #define GPIO_TRANS_EN	GPIO_NUM_32
+
 
 #define DAC_A				0x11				// Array indexes for each of the DAC channels
 #define DAC_B				0x12				// These also set the command and address byte in the DACs
@@ -57,13 +67,14 @@
 #define DAC_D				0x18
 #define DAC_UPDATE_PERIOD	0x21				// Time period between the DAC data transmission.
 #define DAC_NUM_ICS			0x22				// Number of DACs in daisy-chain.
+#define TIMER_STATE			0x23
 
 #define DAC_1	0								// Array indexes for each of the individual DAC ICs
 #define DAC_2	1
 #define DAC_3	2
 #define DAC_4	3
 
-#define BUFFER_SIZE_MAX 		24					// Number of data points in sine wave array
+#define BUFFER_SIZE_MAX 		48					// Number of data points in sine wave array
 #define SERIAL_BUFFER_SIZE_MAX 	(BUFFER_SIZE_MAX * 2) 	// 2 bytes per data point.
 #define DAC_ICS_MAX 			6					// Initial testings with 3 DAC ICs for 12 speakers on outer ring.
 
@@ -109,19 +120,23 @@ void TimerInit(void);
 void SpiInit(void);
 void DacInit(void);
 void GpioInit(void);
+
 void UpdateTimerPeriod(serialRx_t *ptr_rxBuffer);
 void UpdateDacNumICs(serialRx_t *ptr_rxBuffer);
+void UpdateTimerState(serialRx_t *ptr_rxBuffer);
+
 void PopulateTransData(spi_transaction_t *ptr_trans, uint8_t *ptr_buffer, serialRx_t *ptr_rxBuffer);
 void PrintfChannelBuffer(uint8_t *ptr_buffer);
+
 static void SerialTask(void *pvParameters);
 static void ParseSerialDataTask(void *pvParameters);
 static void SpiTask(void *pvParameters);
-static void TimerEnableTask(void *pvParameters);
 
 /***************************************************************************************
  *  Function: PingSPI_isr
  *
- *
+ *	This ISR is called by the timer interrupt firing. It notfies the SpiTask that it
+ *	should send the next data transmission.
  *
  *  Returns:
  *  - Void
@@ -197,9 +212,9 @@ static void ParseSerialDataTask(void *pvParameters)
 		xStatus = xQueueReceive(xQueue, &packet, 0);
 		if( xStatus == pdPASS ){
 			ESP_LOGI(TAG, "Parsing new data...");
-			ESP_LOGI(TAG, "Size:\t%d", packet.size);
-			ESP_LOGI(TAG, "Type:\t%x", packet.type);
-			ESP_LOGI(TAG, "Delim:\t'%c'", packet.data[packet.size - 3]);
+			ESP_LOGI(TAG, "Size: %d", packet.size);
+			ESP_LOGI(TAG, "Type: %x", packet.type);
+			ESP_LOGI(TAG, "Delim: '%c'", packet.data[packet.size - 3]);
 
 			switch(packet.type){
 				case DAC_A:
@@ -223,18 +238,46 @@ static void ParseSerialDataTask(void *pvParameters)
 					PrintfChannelBuffer(&sineBufferCharD[0]);
 					break;
 				case DAC_UPDATE_PERIOD:
-					printf("Updating Timer Interrupt Period\n");
 					UpdateTimerPeriod(&packet);
 					break;
 				case DAC_NUM_ICS:
-					printf("Updating Number of DAC ICs in serial daisy-chain\n");
 					UpdateDacNumICs(&packet);
 					DacInit();
+					break;
+				case TIMER_STATE:
+					UpdateTimerState(&packet);
 					break;
 			}
 			dataReady = 1;
 	    }
 		vTaskDelay(100 / portTICK_PERIOD_MS);
+	}
+}
+
+/***************************************************************************************
+ *  Function: UpdateTimerState
+ *
+ *
+ *
+ *  Returns:
+ *  - Void
+ *  Parameters:
+ *  -
+ *****************************************************************************************/
+void UpdateTimerState(serialRx_t *ptr_rxBuffer)
+{
+	if(ptr_rxBuffer->data[0] == 1){
+		timer_start(TIMER_GROUP_0, TIMER_0);
+		gpio_set_level(GPIO_DEBUG_LED, 1);
+		printf("Timer interrupts ON\n");
+	}
+	else if(ptr_rxBuffer->data[0] == 0){
+			timer_pause(TIMER_GROUP_0, TIMER_0);
+			gpio_set_level(GPIO_DEBUG_LED, 0);
+			printf("Timer interrupts OFF\n");
+	}
+	else{
+		printf("Invalid Timer state data\n");
 	}
 }
 
@@ -252,38 +295,30 @@ void UpdateTimerPeriod(serialRx_t *ptr_rxBuffer)
 {
 	unsigned int msb, lsb, value;
 
-	// Stop the interrupts while we modify the register
-	timer_pause(TIMER_GROUP_0, TIMER_0);
-
 	msb = ptr_rxBuffer->data[0];
 	lsb = ptr_rxBuffer->data[1];
 	value = (msb << 8) | lsb;
 
-	printf("Timer period (us): %d\n", value);
 	timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, value);
-
-	timer_start(TIMER_GROUP_0, TIMER_0);
+	printf("Timer period (us): %d\n", value);
 }
 
 /***************************************************************************************
  *  Function: UpdateDacNumICs
  *
- *
+ *	Retieves the data from the rx packet and stores it in the global dacNumICs variable.
+ *	The DacInit() function will actual use the SPI bus to update the daisy-chain
+ *	register within each DAC.
  *
  *  Returns:
  *  - Void
  *  Parameters:
- *  -
+ *  - *ptr_rxBuffer		Ptr to serial rx data struct ready for formatting.
  *****************************************************************************************/
 void UpdateDacNumICs(serialRx_t *ptr_rxBuffer)
 {
-	// Stop the interrupts while we modify the number of DACs
-	timer_pause(TIMER_GROUP_0, TIMER_0);
-
 	dacNumICs = ptr_rxBuffer->data[0];
 	ESP_LOGI(TAG, "Number of DAC ICs: %d", dacNumICs);
-
-	timer_start(TIMER_GROUP_0, TIMER_0);
 }
 /***************************************************************************************
  *  Function: PopulateTransData
@@ -336,7 +371,9 @@ void PopulateTransData(spi_transaction_t *ptr_trans, uint8_t *ptr_buffer, serial
 /***************************************************************************************
  *  Function: SpiTask
  *
- *
+ *	Sends the transX buffer data over the SPI. This function is normally called after a
+ *	timer interrupt. The transX buffers are 2D arrays, each call of this function
+ *	transmits 1 row, as indicated by the bufferIndex.
  *
  *  Returns:
  *  - Void
@@ -369,7 +406,8 @@ void SpiTask(void *pvParameters)
 /***************************************************************************************
  *  Function: PrintfChannelBuffer
  *
- *
+ *	In table form show all the data in 16-bit hex format for the specified channel.
+ *	The columns indicate which DAC number and the rows indicate the sample number.
  *
  *  Returns:
  *  - Void
@@ -399,33 +437,15 @@ void PrintfChannelBuffer(uint8_t *ptr_buffer)
 }
 
 /***************************************************************************************
- *  Function: TimerEnableTask
+ *  Function: TimerInit
  *
- *
+ *	Configure, but do not start the timer. Se the period with a default value.
  *
  *  Returns:
  *  - Void
  *  Parameters:
- *  - *pvParameters
+ *  - Void
  *****************************************************************************************/
-void TimerEnableTask(void *pvParameters)
-{
-	while(1){
-		if(gpio_get_level(GPIO_TIMER_EN) == 1){
-			timer_start(TIMER_GROUP_0, TIMER_0);
-			gpio_set_level(GPIO_DEBUG_LED, 1);
-		}
-		else{
-			timer_pause(TIMER_GROUP_0, TIMER_0);
-			gpio_set_level(GPIO_DEBUG_LED, 0);
-		}
-		vTaskDelay(500 / portTICK_PERIOD_MS);
-	}
-
-}
-/***********************
- *  Function: TimerInit
- ***********************/
 void TimerInit()
 {
 	timer_config_t tmrcfg;
@@ -447,9 +467,16 @@ void TimerInit()
 	timer_pause(TIMER_GROUP_0, TIMER_0);
 }
 
-/*********************
+/***************************************************************************************
  *  Function: SpiInit
- *********************/
+ *
+ *	Configure the SPI bus. e.g. pins, freq, spi mode.
+ *
+ *  Returns:
+ *  - Void
+ *  Parameters:
+ *  - Void
+ *****************************************************************************************/
 void SpiInit()
 {
 	// Configure SPI pins and frequency, mode etc...
@@ -462,7 +489,7 @@ void SpiInit()
 	};
 
 	spi_device_interface_config_t devcfg={
-		.clock_speed_hz=1000*1000*1,           //Clock out at 10 MHz
+		.clock_speed_hz=1000*1000*20,           //Clock out at 10 MHz
 		.mode=1,                                //SPI mode 1
 		.spics_io_num=PIN_NUM_CS,               //CS pin
 		.queue_size=7,                          //We want to be able to queue 7 transactions at a time
@@ -477,11 +504,6 @@ void SpiInit()
 	//Attach the DAC to the SPI bus
 	ret=spi_bus_add_device(HSPI_HOST, &devcfg, &spi);
 	assert(ret==ESP_OK);
-	// Setup LDAC and RESET pins
-	gpio_set_direction(PIN_NUM_LDAC, GPIO_MODE_OUTPUT);
-	gpio_set_direction(PIN_NUM_RESET, GPIO_MODE_OUTPUT);
-	gpio_set_level(PIN_NUM_LDAC, 0);
-	gpio_set_level(PIN_NUM_RESET, 1);
 
 	// Acquire the bus for faster transactions since there is only on SPI device.
 	ret = spi_device_acquire_bus(spi, portMAX_DELAY);
@@ -490,7 +512,10 @@ void SpiInit()
 /***************************************************************************************
  *  Function: DACInit
  *
- *  Current hard coded to setup first 3 DACs in daisy-chain mode
+ *  To enable daisy-chain mode, set bit-0 to 1 in the daisy-chain register (0x80).
+ *  Write 0x800001 over SPI to do this. Since the previous DACs daisy-chain mode must be
+ *  enabled first before it can pass information onto the next DAC, the command must be
+ *  repeated according to the number of DACs in the chain.
  *
  *  Returns:
  *  - Void
@@ -501,24 +526,25 @@ void DacInit()
 {
 	int i, j;
 	static spi_transaction_t transSetup;
-	uint8_t setupBuffer[9];
+	uint8_t setupBuffer[3 * 6];					// 3 bytes for each of 6 eurocards
 
 	// Repeat 3 bytes for each DAC we need to enable daisy-chain mode
-	for(i = 0; i < dacNumICs; i++)
-	{
+	for(i = 0; i < dacNumICs; i++){
 		j = 3*i;
 		setupBuffer[j] = 0x80;					// Set the DCEN bit to enter register (MSB)
 		setupBuffer[j + 1] = 0x00;				// (LSB)
 		setupBuffer[j + 2] = 0x01;				// Set DB0 to 1 to enable daisy-chain mode
 
-		transSetup.length = 24 * (i + 1);				// length in bits to transmit
+		transSetup.length = 24 * (i + 1);		// length in bits to transmit
 		transSetup.tx_buffer = &setupBuffer;
 		transSetup.flags = 0;
 		transSetup.cmd = 0;
 		transSetup.addr = 0;
 
+		//spi_device_polling_end(spi, 100);
 		spi_device_polling_transmit(spi, &transSetup);
 	}
+	printf("Number of DACs in daisy-chain: %d", dacNumICs);
 }
 /***************************************************************************************
  *  Function: GpioInit
@@ -532,38 +558,51 @@ void DacInit()
  *****************************************************************************************/
 void GpioInit(void)
 {
+	// Setup LDAC and RESET pins - these outputs are not controlled by the
+	// SPI library functions.
+	PIN_FUNC_SELECT(IO_MUX_GPIO16_REG, PIN_FUNC_GPIO);
+	gpio_set_direction(PIN_NUM_LDAC, GPIO_MODE_OUTPUT);
+	gpio_set_level(PIN_NUM_LDAC, 1);
+
+	PIN_FUNC_SELECT(IO_MUX_GPIO19_REG, PIN_FUNC_GPIO);
+	gpio_set_direction(PIN_NUM_RESET, GPIO_MODE_OUTPUT);
+	gpio_set_level(PIN_NUM_RESET, 1);
+
 	// Setup Debug red LED GPIO pin
 	PIN_FUNC_SELECT(IO_MUX_GPIO12_REG, PIN_FUNC_GPIO);
 	gpio_set_direction(GPIO_DEBUG_LED, GPIO_MODE_OUTPUT);
+
+	// Setup Debug output GPIO pin
+	PIN_FUNC_SELECT(IO_MUX_GPIO26_REG, PIN_FUNC_GPIO);
+	gpio_set_direction(GPIO_DEBUG_PIN, GPIO_MODE_OUTPUT);
+
+	// Setup logic translator enable pin
+	PIN_FUNC_SELECT(IO_MUX_GPIO32_REG, PIN_FUNC_GPIO);
+	gpio_set_direction(GPIO_TRANS_EN, GPIO_MODE_OUTPUT);
+	// And permanently enable the translators
+	gpio_set_level(GPIO_TRANS_EN, 1);
 
 	// Timer enable switch input
 	PIN_FUNC_SELECT(IO_MUX_GPIO27_REG, PIN_FUNC_GPIO);
 	gpio_set_direction(GPIO_TIMER_EN, GPIO_MODE_INPUT);
 	gpio_set_pull_mode(GPIO_TIMER_EN, GPIO_PULLUP_ONLY);
 
-	// Output Level Translator Setup and Enable
-	PIN_FUNC_SELECT(IO_MUX_GPIO32_REG, PIN_FUNC_GPIO);
-	gpio_set_direction(GPIO_TRANS_EN, GPIO_MODE_OUTPUT);
-	gpio_set_level(GPIO_TRANS_EN, 1);
 }
-/******************
- *  Function: Main
- ******************/
-void app_main()
+/***************************************************************************************
+ *  Function: PrintEsp32Info
+ *
+ *	Print out ESP32 information.
+ *
+ *  Returns:
+ *  - Void
+ *  Parameters:
+ *  - Void
+ *****************************************************************************************/
+void PrintEsp32Info()
 {
-	esp_log_level_set(TAG, ESP_LOG_DEBUG);
-
-	bufferIndex = 0;
-	spiSendNow = 0;
-	dataReady = 0;
-
-	GpioInit();
-	SpiInit();
-	SerialInit();
-
 	printf("----------------------\n");
 	printf("NanoTeslaCCS - ESP32\n");
-    printf("Version: 7e\n");
+    printf("Version: 8I\n");
     printf("----------------------\n");
     printf("FreeRTOS tick rate: %dHz\n", configTICK_RATE_HZ );
     printf("Interrupt period (default): %dus\n", TIMER_PERIOD_US);
@@ -580,6 +619,32 @@ void app_main()
 
     printf("%dMB %s flash\n", spi_flash_get_chip_size() / (1024 * 1024),
             (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
+}
+
+/***************************************************************************************
+ *  Function: app_main
+
+ *
+ *  Returns:
+ *  - Void
+ *  Parameters:
+ *  - Void
+ *****************************************************************************************/
+void app_main()
+{
+	esp_log_level_set(TAG, ESP_LOG_DEBUG);
+
+	bufferIndex = 0;
+	spiSendNow = 0;
+	dataReady = 0;
+
+	dacNumICs = 6;
+
+	GpioInit();
+	SpiInit();
+	SerialInit();
+	DacInit();
+	TimerInit();
 
     vTaskDelay(100);
     // Take LDAC high, it will be toggled low during interrupt to update DAC outputs.
@@ -587,26 +652,22 @@ void app_main()
 
     // Create Queue
     xQueue = xQueueCreate(5, (((SERIAL_BUFFER_SIZE_MAX * DAC_ICS_MAX) + 3) * sizeof(int)));
-    if(xQueue != NULL){
-    	// Create Tasks
-    	printf("Init Free heap size: %d\n", xPortGetFreeHeapSize());
 
+    if(xQueue != NULL){
+    	printf("Init Free heap size: %d\n", xPortGetFreeHeapSize());
+    	// Create Tasks
     	xTaskCreate(SpiTask, "Spi_task", 50 * 1024, NULL, 6, &xHandlingTask);
-		xTaskCreate(TimerEnableTask, "timer_en_task", 20 * 1024, NULL, 3, NULL);
 		xTaskCreate(SerialTask, "uart_2_task", 50 * 1024, NULL, 5, NULL);
 		xTaskCreate(ParseSerialDataTask, "parse_task", 50 * 1024, NULL, 4, NULL);
 
 		printf("All task created, remaining heap size: %d\n", xPortGetFreeHeapSize());
 		printf("Waiting...\n");
-
 		vTaskDelay(100);
     }
     else{
     	printf("Failed to create xQueue");
     }
-
-    TimerInit();
-
+    // Loop here waiting for tasks...
     while(1){
     	vTaskDelay(100 / portTICK_PERIOD_MS);
     }
