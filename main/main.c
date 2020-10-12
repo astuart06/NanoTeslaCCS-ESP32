@@ -36,7 +36,7 @@
 #define LOG_LOCAL_LEVEL ESP_LOG_WARN
 #include "esp_log.h"
 
-#include "globals.h"
+//#include "globals.h"
 
 #define PI 3.14159
 /*
@@ -256,7 +256,7 @@ static void ParseSerialDataTask(void *pvParameters)
 
 /***************************************************************************************
  *  Function: UpdateTimerState
- *
+ *	
  *
  *
  *  Returns:
@@ -602,7 +602,7 @@ void PrintEsp32Info()
 {
 	printf("----------------------\n");
 	printf("NanoTeslaCCS - ESP32\n");
-    printf("Version: 8I\n");
+    printf("Version: V1.0.0\n");
     printf("----------------------\n");
     printf("FreeRTOS tick rate: %dHz\n", configTICK_RATE_HZ );
     printf("Interrupt period (default): %dus\n", TIMER_PERIOD_US);
@@ -620,7 +620,7 @@ void PrintEsp32Info()
     printf("%dMB %s flash\n", spi_flash_get_chip_size() / (1024 * 1024),
             (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
 }
-
+\
 /***************************************************************************************
  *  Function: app_main
 
